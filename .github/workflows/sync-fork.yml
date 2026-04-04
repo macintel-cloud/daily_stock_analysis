@@ -1,0 +1,29 @@
+name: Sync fork with upstream
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # 每 6 小时同步一次（UTC）
+  workflow_dispatch:        # 支持在 GitHub 页面手动点按钮执行
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Sync with upstream
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.1
+        with:
+          upstream_repository: ZhuLinsen/daily_stock_analysis
+          upstream_branch: main
+          target_branch: main
+          git_pull_args: --ff-only
+          github_token: ${{ secrets.GITHUB_TOKEN }}
