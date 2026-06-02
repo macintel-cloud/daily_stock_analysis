@@ -62,6 +62,11 @@ from src.core.market_review_lock import (
 from src.core.market_review_runtime import (
     build_market_review_runtime as _runtime_build_market_review_runtime,
 )
+from src.analysis_context_pack_overview import (
+    extract_analysis_context_pack_overview,
+    sanitize_context_snapshot_for_api,
+)
+from src.market_phase_summary import extract_market_phase_summary
 from src.report_language import get_localized_stock_name, normalize_report_language
 from src.services.name_to_code_resolver import resolve_name_to_code
 from src.services.stock_code_utils import is_code_like
@@ -70,6 +75,7 @@ from src.services.task_queue import (
     DuplicateTaskError,
     TaskStatus as TaskStatusEnum,
 )
+from src.services.run_diagnostics import build_run_diagnostic_summary
 from src.utils.data_processing import (
     normalize_model_used,
     parse_json_field,
@@ -465,6 +471,7 @@ def _handle_sync_analysis(
             stock_code=result.get("stock_code", stock_code),
             stock_name=result.get("stock_name"),
             report=report.model_dump() if report else None,
+            diagnostic_summary=result.get("diagnostic_summary"),
             created_at=datetime.now().isoformat()
         )
 
@@ -728,6 +735,18 @@ def _extract_report_created_at(payload: Dict[str, Any]) -> Optional[str]:
     return _datetime_to_iso(meta.get("created_at"))
 
 
+def _prepare_report_for_task_enrichment(
+    report_data: Dict[str, Any],
+    created_at: Optional[str],
+) -> Dict[str, Any]:
+    enriched_report = dict(report_data)
+    meta = dict(enriched_report.get("meta") or {})
+    if created_at and not _datetime_to_iso(meta.get("created_at")):
+        meta["created_at"] = created_at
+    enriched_report["meta"] = meta
+    return enriched_report
+
+
 def _build_task_analysis_result(task: Any) -> AnalysisResultResponse:
     """
     Normalize an in-memory completed task result to the public API contract.
@@ -766,7 +785,10 @@ def _build_task_analysis_result(task: Any) -> AnalysisResultResponse:
         if context_snapshot is not None or fundamental_snapshot is not None:
             try:
                 report = _build_analysis_report(
-                    report_data,
+                    _prepare_report_for_task_enrichment(
+                        report_data,
+                        payload.get("created_at"),
+                    ),
                     query_id,
                     stock_code,
                     payload.get("stock_name") or getattr(task, "stock_name", None),
@@ -889,6 +911,9 @@ def get_analysis_status(task_id: str) -> TaskStatus:
             # Extract current_price / change_pct from context_snapshot
             skills = None
             context_snapshot = parse_json_field(getattr(record, 'context_snapshot', None))
+            analysis_context_pack_overview = extract_analysis_context_pack_overview(context_snapshot)
+            market_phase_summary = extract_market_phase_summary(context_snapshot)
+            api_context_snapshot = sanitize_context_snapshot_for_api(context_snapshot)
             if context_snapshot and isinstance(context_snapshot, dict):
                 raw_skills = context_snapshot.get("skills")
                 if isinstance(raw_skills, list):
@@ -910,11 +935,12 @@ def get_analysis_status(task_id: str) -> TaskStatus:
             )
             has_board_details = bool(extracted_boards.get("belong_boards")) or extracted_boards.get("sector_rankings") is not None
             details = None
-            if any(extracted_fundamental.values()) or has_board_details or context_snapshot is not None:
+            if any(extracted_fundamental.values()) or has_board_details or context_snapshot is not None or analysis_context_pack_overview is not None:
                 details = ReportDetails(
                     news_content=getattr(record, "news_content", None),
                     raw_result=raw_result,
-                    context_snapshot=context_snapshot,
+                    context_snapshot=api_context_snapshot,
+                    analysis_context_pack_overview=analysis_context_pack_overview,
                     financial_report=extracted_fundamental.get("financial_report"),
                     dividend_metrics=extracted_fundamental.get("dividend_metrics"),
                     belong_boards=extracted_boards.get("belong_boards"),
@@ -934,6 +960,7 @@ def get_analysis_status(task_id: str) -> TaskStatus:
                     model_used=model_used,
                     current_price=current_price,
                     change_pct=change_pct,
+                    market_phase_summary=market_phase_summary,
                 ),
                 summary=ReportSummary(
                     sentiment_score=record.sentiment_score,
@@ -960,6 +987,13 @@ def get_analysis_status(task_id: str) -> TaskStatus:
                     stock_code=record.code,
                     stock_name=stock_name,
                     report=report_dict,
+                    diagnostic_summary=build_run_diagnostic_summary(
+                        context_snapshot=context_snapshot,
+                        raw_result=raw_result,
+                        report_saved=True,
+                        query_id=task_id,
+                        stock_code=record.code,
+                    ),
                     created_at=record.created_at.isoformat() if record.created_at else datetime.now().isoformat()
                 ),
                 error=None,
@@ -1072,6 +1106,7 @@ def _build_analysis_report(
     change_pct = meta_data.get("change_pct")
     if change_pct is None:
         change_pct = realtime_fields.get("change_pct")
+    market_phase_summary = extract_market_phase_summary(context_snapshot)
 
     meta = ReportMeta(
         query_id=meta_data.get("query_id", query_id),
@@ -1083,6 +1118,7 @@ def _build_analysis_report(
         current_price=current_price,
         change_pct=change_pct,
         model_used=normalize_model_used(meta_data.get("model_used")),
+        market_phase_summary=market_phase_summary,
     )
 
     summary = ReportSummary(
@@ -1110,13 +1146,16 @@ def _build_analysis_report(
         context_snapshot=context_snapshot,
         fallback_fundamental_payload=fallback_fundamental_payload,
     )
+    analysis_context_pack_overview = extract_analysis_context_pack_overview(context_snapshot)
+    api_context_snapshot = sanitize_context_snapshot_for_api(context_snapshot)
     details = None
     has_board_details = bool(extracted_boards.get("belong_boards")) or extracted_boards.get("sector_rankings") is not None
-    if details_data or any(extracted_fundamental.values()) or has_board_details or context_snapshot is not None:
+    if details_data or any(extracted_fundamental.values()) or has_board_details or context_snapshot is not None or analysis_context_pack_overview is not None:
         details = ReportDetails(
             news_content=details_data.get("news_summary") or details_data.get("news_content"),
             raw_result=details_data,
-            context_snapshot=context_snapshot,
+            context_snapshot=api_context_snapshot,
+            analysis_context_pack_overview=analysis_context_pack_overview,
             financial_report=extracted_fundamental.get("financial_report"),
             dividend_metrics=extracted_fundamental.get("dividend_metrics"),
             belong_boards=extracted_boards.get("belong_boards"),
